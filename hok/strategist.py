@@ -58,6 +58,10 @@ dealt minus taken. A kill is useful only as the time it buys to hit a structure,
 - Hero speed is measured (memory.measured.hero_speed_units_per_s; a hero crosses the whole lane in roughly 25 s). A hero that dies is out for revive_s seconds (11 at level 2 up to about 35 \
 at level 10); in that time the other side can take a tower freely: five heroes destroyed a 4000-hp tower in about 6 \
 seconds. A wipe or a lopsided fight is therefore worth a tower; a lost fight is worth the same to them.
+- Healing at our base is SLOW: memory.measured.base_heal_pct_max_hp_per_s (about 0.35% of max hp per second in our \
+matches, so half hp takes over two minutes). "Go home and heal" takes a hero out for minutes, not seconds; in one match \
+three hurt heroes sat at the spring while unseen attackers destroyed our crystal. A hurt hero is usually worth more \
+standing at the structure that needs it than at the spring.
 - Each enemy hero in reach costs about hp_lost_per_second_per_enemy_in_reach hp per second (measured). Retreat walks all \
 the way to base, so a hero in contact cannot get away unless it outlasts the walk (survive_s vs flee_s in its reading).
 - Structures are also hit by attackers the server does NOT list (no enemy hero in sight near the structure, sometimes \

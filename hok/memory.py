@@ -38,6 +38,8 @@ MAX_PLANS = 12
 SNAPSHOT_EVERY_S = 20.0
 TEMPO_NOW_S = 30.0  # measurement window: structure damage per second "lately"
 TEMPO_BURST_S = 20.0  # measurement window: the fastest siege each side has shown this match
+HEAL_PRIOR = 0.0035  # prior: share of max hp healed per second at our base (four recorded matches: 0.28-0.37 %/s)
+HEAL_PRIOR_WEIGHT = 20  # pseudo-samples of that prior
 SIEGE_PRIOR_HP_S = 200.0  # prior: fastest 20 s siege in recorded matches (88694: 200, 76599: 290 hp/s); a faster one
 #                           seen in this match replaces it. Both teams have the same macros, so it applies to either.
 
@@ -147,6 +149,7 @@ class MatchMemory:
         self.seconds_left: float | None = None
         self.max_steps: float | None = None
         # every structure hp loss: (step, ours, hp lost, no living enemy hero in sight within reach of it)
+        self._heal: deque[float] = deque(maxlen=300)  # share of max hp regained per second, hurt and at base
         self._struct_log: deque[tuple[int, bool, float, bool]] = deque(maxlen=4000)
 
     # -- update ------------------------------------------------------------------------
@@ -183,6 +186,11 @@ class MatchMemory:
                 if n_reach and (h.get("hp") or 0) > 0 and dt > 0:
                     self._exposure += dt * n_reach
                     self._lost_hp += max(0.0, dhp)
+                mx = h.get("max_hp") or 0
+                if (dt > 0 and mx > 0 and dhp < 0 and (prev.get("hp") or 0) > 0 and (prev.get("hp") or 0) < mx
+                        and (h.get("deaths") or 0) == (prev.get("deaths") or 0) and dist(pos(h), self.home()) <= self.R
+                        and not any(dist(pos(h), pos(e)) <= self.R for e in visible_now)):
+                    self._heal.append(-dhp / mx / dt)
                 p0, p1 = pos(prev), pos(h)
                 if dt > 0 and p0 and p1 and (h.get("hp") or 0) > 0 and (prev.get("hp") or 0) > 0:
                     sp = dist(p0, p1) / dt
@@ -477,6 +485,15 @@ class MatchMemory:
         return best
 
     @property
+    def heal_rate(self) -> float:
+        """Share of max hp a hurt hero regains per second at our base, learned this match on top of a prior."""
+        return (sum(self._heal) + HEAL_PRIOR * HEAL_PRIOR_WEIGHT) / (len(self._heal) + HEAL_PRIOR_WEIGHT)
+
+    def heal_s(self, hp_share: float) -> float:
+        """Seconds at base to get from this hp share back to full."""
+        return max(0.0, 1.0 - hp_share) / max(self.heal_rate, 1e-6)
+
+    @property
     def speed(self) -> float:
         """Observed hero walking speed, game units per second (median of recent moves)."""
         if len(self._speeds) < 5:
@@ -616,7 +633,9 @@ class MatchMemory:
             "lane": self._lane_json(),
             "measured": {"hp_lost_per_second_per_enemy_in_reach": round(self.incoming),
                          "hero_speed_units_per_s": round(self.speed), "engagement_radius": round(self.R),
-                         "revive_s_by_level": dict(sorted(self._revive.items()))},
+                         "revive_s_by_level": dict(sorted(self._revive.items())),
+                         "base_heal_pct_max_hp_per_s": round(100 * self.heal_rate, 2),
+                         "base_heal_s_from_half_hp": round(self.heal_s(0.5))},
             "score": {"structure_hp_dealt": round(self.dealt), "structure_hp_taken": round(self.taken),
                       "our_kills": self.team_kills, "our_deaths": self.team_deaths},
             "our_heroes": {str(s): {k: h.get(k) for k in ("hero_id", "hp", "max_hp", "level", "x", "z",

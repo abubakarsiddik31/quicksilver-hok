@@ -357,9 +357,10 @@ class HokAgent:
                 and plan.stance(seat) == "auto"
             ):
                 # Nobody is on this hero: "retreat" would only be a trip home to heal. Go only if healing beats
-                # staying: a round trip of 2 x flee_s misses that share of the time between fights, so a hero
-                # with more hp than 1 - trip/interval is worth more at the tower than on the road.
-                trip = 2.0 * reading.flee_s
+                # staying: the time away (the round trip of 2 x flee_s plus the time the base needs to heal it,
+                # at the rate measured this match) misses that share of the time between fights, so a hero with
+                # more hp than 1 - away/interval is worth more at the tower than on the road or at the spring.
+                trip = 2.0 * reading.flee_s + self.memory.heal_s(reading.hp_share)
                 if reading.hp_share >= 1.0 - trip / max(self.memory.fight_interval(), 1e-6):
                     stance, hold, source = "engage", True, source + "/stay"
             if stance == "retreat" and "macro_retreat" in macros:
