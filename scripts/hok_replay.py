@@ -28,6 +28,7 @@ def main(path: str) -> int:
     plan, max_steps = Plan(), 3000
     last_order: dict[int, str] = {}
     counts: Counter = Counter()
+    pushes: Counter = Counter()  # hero-decisions walking on under "defend" because the destination is undefended
     away_while_hit = moved_to_defend = 0
     shown: set[int] = set()
     for line in open(path):
@@ -77,6 +78,8 @@ def main(path: str) -> int:
                     continue
                 want, source = agent._decide(None, seat, macros, plan)  # type: ignore[arg-type]
                 counts[source] += 1
+                if plan.posture == "defend" and want == "macro_advance" and source == "model":
+                    pushes[int(m.step * STEP_S) // 60] += 1
                 if siege is not None:
                     toward = agent._toward(seat, siege, macros)
                     if (
@@ -97,6 +100,7 @@ def main(path: str) -> int:
         f"hero-seconds walking away from our structure under attack (old orders): {away_while_hit}; "
         f"new code sends them to it instead: {moved_to_defend}"
     )
+    print("defend-posture walk-ons into an undefended destination, per minute:", dict(sorted(pushes.items())))
     print(f"final: dealt {round(m.dealt)} taken {round(m.taken)}")
     return 0
 

@@ -80,8 +80,10 @@ enemies are dead and cannot be back in time, fighting when cornered, holding at 
 because enemies were dead 20 seconds ago; set the posture that fits what is likely over the next minute.
 
 WHAT YOUR PLAN DOES
-- posture "defend": no hero walks past our front tower unless an enemy is in its reach; they gather at the tower and \
-fight what comes. "balanced": heroes advance only while the force expected where they are going is one they beat \
+- posture "defend": heroes gather at our front tower and fight what comes; a hero walks on only when the fight model \
+expects the destination to be undefended (fewer than one enemy hero able to be there when it arrives), which is the \
+punish window. The executor catches those windows itself, every step, because they last about as long as your \
+latency. Do not refuse a push because "they will be back before the plan arrives": that is the executor's call. "balanced": heroes advance only while the force expected where they are going is one they beat \
 (the fight model's `ahead` reading), otherwise they hold at the tower. "pressure": heroes advance regardless of the \
 `ahead` reading (the `here` readings still decide fights and retreats).
 - risk: a hero fights on while (its local power ratio x its hp share) >= risk. Below 1 is bold, 1 parity, above 1 cautious.
@@ -108,7 +110,10 @@ tie-break. Your plan reaches the heroes 10-25 s late: judge the window as it wil
 they are back.
 - 4. NEVER LEAVE OUR CRYSTAL OR A TOWER EXPOSED to go somewhere else. Read `side` on every structure: OURS or THEIRS. \
 Do not confuse them.
-- 5. A LEAD IS MEASURED IN SECONDS, NOT HP. memory.tempo.structure_margin_in_s_of_fastest_siege says how many \
+- 5. A KILL LEAD IS NOT A LEAD. At 0 structure damage each, the first structure hit decides the match, whatever the \
+kills. In one match we were +33 kills at 0-0 with 110 s left, the General called it "victory guaranteed" for ten plans, \
+and one enemy push took 15,000 hp of structures. Every punish window we skip is structure damage we chose not to take.
+- 6. A LEAD IS MEASURED IN SECONDS, NOT HP. memory.tempo.structure_margin_in_s_of_fastest_siege says how many \
 seconds of the fastest siege known (fastest_siege_known_hp_per_s) our structure lead absorbs; compare it with game_seconds_left. In our last match \
 we held a 151-hp lead with 12 more kills, called the game "secured" for ten plans while defending and dealing nothing, \
 and lost: 151 hp was under one second of their siege, and they took 4000 hp in the last minute. A lead smaller than \

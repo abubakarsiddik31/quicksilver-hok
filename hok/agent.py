@@ -377,12 +377,15 @@ class HokAgent:
                             toward = self._toward(seat, siege, macros)
                             return (toward or HOLD), "model/defend"
                         return HOLD, "model/defend"
-                # Nothing in reach: this hero is about to walk into something. "defend" never walks in; "pressure"
-                # always does; otherwise it goes only if the force expected where it is going is one it can beat.
+                # Nothing in reach: this hero is about to walk into something. "pressure" always goes; otherwise it
+                # goes only if the force expected where it is going is one it can beat. "defend" also stays home
+                # unless the destination is undefended: the fight model expects less than one enemy hero there by
+                # the time this hero arrives (dead ones still dead, the rest unable to get there). That is a punish
+                # window, and it is too short for the General, whose plans arrive 10-25 s late, to catch.
                 ahead = self._ahead.get(seat)
                 if (
                     hold
-                    or plan.posture == "defend"
+                    or (plan.posture == "defend" and not self._undefended(ahead))
                     or (
                         plan.posture != "pressure"
                         and ahead is not None
@@ -397,6 +400,13 @@ class HokAgent:
         want = floor_macro(seat_summary(state, seat), macros)
         self._note_fallback("floor", "model could not decide", seat, want)
         return want, "floor"
+
+    def _undefended(self, ahead: Reading | None) -> bool:
+        """The destination holds only its structure: no enemy hero in sight there, and the believed share of the
+        unseen ones (dead heroes that will be back, heroes that could walk there) is under one hero."""
+        if ahead is None or ahead.visible_enemies:
+            return False
+        return ahead.hidden_counted < self.judge._hero_unit()
 
     def _toward(self, seat: int, point: tuple[float, float], macros: dict[str, str]) -> str | None:
         """The lane direction that takes this hero to ``point``: advance and retreat are fixed joystick
