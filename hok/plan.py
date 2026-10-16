@@ -21,6 +21,7 @@ STANCES = ("auto", "engage", "retreat")
 RISK_MIN, RISK_MAX = 0.4, 3.0
 REVIEW_MIN_S, REVIEW_MAX_S = 4.0, 40.0
 ASSESSMENT_MAX = 300
+TRUST_MIN, TRUST_MAX = 0.5, 0.95
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,7 @@ class Plan:
     risk: float = 1.0
     heroes: dict[int, str] = field(default_factory=dict)  # seat -> stance override; absent means auto
     review_in_s: float = 15.0
+    jev_trust: float = 0.8  # how sure Jev must be before its caution overrules an engage
     assessment: str = "default plan"
 
     def stance(self, seat: int) -> str:
@@ -37,7 +39,7 @@ class Plan:
     def as_json(self) -> dict[str, Any]:
         return {"posture": self.posture, "risk": self.risk,
                 "heroes": {str(s): v for s, v in sorted(self.heroes.items())},
-                "review_in_s": self.review_in_s, "assessment": self.assessment}
+                "review_in_s": self.review_in_s, "jev_trust": self.jev_trust, "assessment": self.assessment}
 
 
 DEFAULT_PLAN = Plan()
@@ -78,6 +80,7 @@ def parse_plan(text: str | None, previous: Plan, seats: list[int]) -> Plan | Non
         risk=_clamp(data.get("risk"), RISK_MIN, RISK_MAX, previous.risk),
         heroes=heroes,
         review_in_s=_clamp(data.get("review_in_s"), REVIEW_MIN_S, REVIEW_MAX_S, previous.review_in_s),
+        jev_trust=_clamp(data.get("jev_trust"), TRUST_MIN, TRUST_MAX, previous.jev_trust),
         assessment=assessment,
     )
 
@@ -95,8 +98,9 @@ def plan_schema(seats: list[int]) -> dict[str, Any]:
                 "additionalProperties": False,
             },
             "review_in_s": {"type": "number", "minimum": REVIEW_MIN_S, "maximum": REVIEW_MAX_S},
+            "jev_trust": {"type": "number", "minimum": TRUST_MIN, "maximum": TRUST_MAX},
             "assessment": {"type": "string"},
         },
-        "required": ["posture", "risk", "heroes", "review_in_s", "assessment"],
+        "required": ["posture", "risk", "heroes", "review_in_s", "jev_trust", "assessment"],
         "additionalProperties": False,
     }

@@ -80,6 +80,17 @@ class Judge:
             far = d + reach
         return min(1.0, (R / max(far, R)) ** 2)
 
+    def _unseen_presence(self, here: tuple[float, float]) -> float:
+        """The chance that enemy heroes never yet seen are within reach of ``here``. The enemy is expected to
+        mirror our team (see :meth:`MatchMemory.mirror_of_team`), with uncertainty that grows with the clock;
+        without lane geometry, spread over the map."""
+        m = self.m
+        mirror = m.mirror_of_team()
+        if mirror is None:
+            return self._arrival(None, here, 0.0)
+        sigma = max(m.R, 0.5 * m.speed * m.step * 0.2)
+        return math.exp(-0.5 * (max(0.0, dist(mirror, here) - m.R) / sigma) ** 2)
+
     def _hero_unit(self) -> float:
         """The power of one average hero: known enemies, else ours."""
         m = self.m
@@ -97,28 +108,38 @@ class Judge:
                 n += 1
         return n
 
-    def _theirs(self, here: tuple[float, float]) -> tuple[float, float, int, int]:
-        """(enemy force, of which unseen, visible heroes, enemy structures) around a point."""
+    def _theirs(self, here: tuple[float, float], lookahead: float = 0.0) -> tuple[float, float, int, int]:
+        """(enemy force, of which unseen, visible heroes, enemy structures) around a point, as it will be
+        ``lookahead`` seconds from now (how long this hero needs to get there). An enemy last seen dead is out
+        only until its revive time runs out; if it will be back by then it counts as a fresh hero at its base."""
         m = self.m
         theirs = hidden = 0.0
         visible = 0
         for e in m.enemies.values():
-            p = power(e.hp, e.level)
+            age = (m.step - e.step) * 0.2
+            last, hp, back_now = e.at(), e.hp, False
+            if hp <= 0:
+                revive = e.revive if e.revive > 0 else m.revive_estimate(e.level)
+                left = revive - age - lookahead
+                if left > 0:
+                    continue  # still dead when we would be there
+                spawn = m._anchor(False)  # back by then: a fresh hero at its base, walking since
+                last, hp, age, back_now = (spawn or last), e.max_hp, -left, True
+            p = power(hp, e.level)
             if p <= 0:
                 continue
-            age = (m.step - e.step) * 0.2
-            if age <= 0.3:  # in sight right now
-                if dist(e.at(), here) <= m.R:
+            if not back_now and age <= 0.3:  # in sight right now: it counts where it stands (a hero sieging a
+                if dist(last, here) <= m.R:  # tower stays at the tower; it does not diffuse while we walk there)
                     theirs += p
                     visible += 1
                 continue
-            w = self._arrival(e.at(), here, age)
+            w = self._arrival(last, here, age if back_now else age + lookahead)
             theirs += w * p
             hidden += w * p
         unit = self._hero_unit()
         unseen = max(0, 5 - len(m.enemies))
         if unseen:
-            w = self._arrival(None, here, 0.0)
+            w = self._unseen_presence(here)
             theirs += unseen * w * unit
             hidden += unseen * w * unit
         structs = self._structures_near(here, enemy=True)
@@ -126,8 +147,8 @@ class Judge:
         theirs = max(theirs, unit)  # the minimum credible threat
         return theirs, hidden, visible, structs
 
-    def _ratio(self, ours: float, theirs: float) -> float:
-        return BIG if theirs <= 0 else min(BIG, ours / theirs * self.m.calibration)
+    def _ratio(self, ours: float, theirs: float, at: tuple[float, float] | None = None) -> float:
+        return BIG if theirs <= 0 else min(BIG, ours / theirs * self.m.calibration_at(at))
 
     @staticmethod
     def _share(me: dict[str, Any]) -> float:
@@ -156,7 +177,7 @@ class Judge:
         survive = (me.get("hp") or 0) / (m.incoming * reach) if reach else math.inf
         home = m.home()
         flee = dist(here, home) / m.speed if home is not None and m.speed > 0 else 0.0
-        return Reading(seat, self._ratio(ours, theirs), ours, theirs, allies, visible, hidden,
+        return Reading(seat, self._ratio(ours, theirs, here), ours, theirs, allies, visible, hidden,
                        self._share(me), structs, survive_s=survive, flee_s=flee, in_reach=reach)
 
     def read_ahead(self, seat: int) -> Reading | None:
@@ -170,7 +191,16 @@ class Judge:
         targets = [pos(s) for s in m.structs.values() if s["hp"] > 0 and s["camp"] != m.camp and pos(s)]
         if not targets:
             return None
-        dest = min(targets, key=lambda t: dist(t, here))
+        return self.read_toward(seat, min(targets, key=lambda t: dist(t, here)), "ahead")
+
+    def read_toward(self, seat: int, dest: tuple[float, float], kind: str) -> Reading | None:
+        """The fight at ``dest`` for this hero: only the allies who will be there about when it is count on our
+        side (with our own structures there), the visible and believed enemies and their structures on theirs."""
+        m = self.m
+        me = m.ours.get(seat)
+        here = pos(me)
+        if me is None or here is None or (me.get("hp") or 0) <= 0:
+            return None
         mine = dist(here, dest)
         ours = 0.0
         allies = 0
@@ -178,9 +208,10 @@ class Judge:
             if (h.get("hp") or 0) > 0 and dist(pos(h), dest) <= mine + m.R:
                 ours += power(h.get("hp"), h.get("level"))
                 allies += 1
-        theirs, hidden, visible, structs = self._theirs(dest)
-        return Reading(seat, self._ratio(ours, theirs), ours, theirs, allies, visible, hidden,
-                       self._share(me), structs, kind="ahead")
+        ours += self._structures_near(dest, enemy=False) * STRUCT_HEROES * self._hero_unit()
+        theirs, hidden, visible, structs = self._theirs(dest, lookahead=mine / max(m.speed, 1.0))
+        return Reading(seat, self._ratio(ours, theirs, dest), ours, theirs, allies, visible, hidden,
+                       self._share(me), structs, kind=kind)
 
     @staticmethod
     def can_escape(reading: Reading) -> bool:

@@ -20,6 +20,7 @@ hero without one in lockstep, and never let tracing or a bad field cost a match.
 
 from __future__ import annotations
 
+import atexit
 import dataclasses
 import hashlib
 import os
@@ -28,11 +29,12 @@ import time
 from typing import Any
 
 from altruagent import WAIT, DecisionContext, GameState, LegalAction
+from common.jev import JevClient
 from common.llm import GeminiClient
 from hok import trace
 from hok.battle import Judge, Reading
 from hok.gemini import GeneralModel
-from hok.memory import FIGHT_R, MatchMemory
+from hok.memory import FIGHT_R, MatchMemory, dist, pos
 from hok.observation import (
     distance,
     is_realtime,
@@ -44,8 +46,10 @@ from hok.observation import (
     team_view,
 )
 from hok.strategist import Strategist
+from hok.tactician import Tactician
 
 STATE_EVERY_S = 1.0
+HOLD_BAND_S = 1.0  # a held hero may drift this many seconds of walking either side of the rally point
 RESEND_GUARD_S = 1.0  # roughly the time for a sent order to appear in the next state read
 SNAPSHOT_EVERY_S = 30.0
 HOLD = "hold"
@@ -113,27 +117,28 @@ def complete_raw(raw_actions: list[LegalAction], seat: int) -> dict[str, Any]:
 
 
 class HokAgent:
-    def __init__(self, client: Any | None = None, *, log=None) -> None:
+    def __init__(self, client: Any | None = None, jev: Any | None = None, *, log=None) -> None:
         self._log = log or (lambda m: print(m, file=sys.stderr, flush=True))
         self.memory = MatchMemory()
         self.judge = Judge(self.memory)
         self.general = Strategist(client, log=self._log)
+        self.tactician = Tactician(jev, log=self._log)
         self._readings: dict[int, Reading] = {}
         self._ahead: dict[int, Reading] = {}
+        self._defend: dict[int, Reading] = {}
         self._sent: dict[int, tuple[str, float]] = {}
         self._finished = False
+        atexit.register(self._write_final)
         self._meta_done = False
         self._baseline_camp = os.environ.get("HOK_BASELINE_CAMP", "").strip()
         self._step_seen = -1
         self._last_state_at = 0.0
         self._last_snapshot_at = 0.0
         self.fallbacks: dict[str, int] = {}
-        if client is None:
-            self._log(
-                "[hok] no General: the fight model decides alone (HOK_LLM=1 turns the General on)"
-            )
-        else:
-            self._log("[hok] General on")
+        self._log(
+            f"[hok] General {'on' if client is not None else 'off (HOK_LLM=1 turns it on)'}; "
+            f"Jev {'on' if jev is not None else 'off (needs TYPESAFE_API_KEY; HOK_JEV=0 disables)'}"
+        )
 
     # -- the runner's hooks --------------------------------------------------------------
 
@@ -158,21 +163,16 @@ class HokAgent:
             want, source = self._decide(state, seat, macros, plan)
             if want == HOLD:
                 held = hold_order(offers[seat]["raw"], seat)
-                if held is None:
-                    want = engage_macro(macros, self.memory.R)
-                elif realtime and (seat not in standing or self._recently_sent(seat, HOLD, now)):
-                    continue  # already standing still, or told to a moment ago
-                else:
+                if held is not None:  # the server lists a do-nothing button (it did not in match 1)
+                    if realtime and (seat not in standing or self._recently_sent(seat, HOLD, now)):
+                        continue
                     self._sent[seat] = (HOLD, now)
-                    r = self._ahead.get(seat)
-                    trace.write(
-                        "orders",
-                        order=held,
-                        source=source,
-                        plan_v=self.general.version,
-                        reading=r.as_json() if r else None,
-                    )
+                    trace.write("orders", order=held, source=source, plan_v=self.general.version)
                     return held
+                want = self._hold_macro(seat, macros, standing)
+                source += "/hold"
+                if want is None:
+                    continue  # inside the band and already going the right way: leave it
             if want is None:
                 if realtime:
                     continue  # a dead hero: nothing to send
@@ -206,13 +206,23 @@ class HokAgent:
         # Every answer carries the whole game state (30 of 33 MB in match 1); the ticks and snapshots hold it.
         slim = {k: v for k, v in result.items() if k != "state"} if isinstance(result, dict) else result
         trace.write("result", result=slim)
-        if isinstance(result, dict) and result.get("error") == "GAME_ALREADY_COMPLETE" and not self._finished:
-            self._finished = True  # the runner's own end-of-game hook never reaches this process
+        if isinstance(result, dict) and result.get("error") == "GAME_ALREADY_COMPLETE":
+            self._write_final("game_already_complete")
+
+    def _write_final(self, why: str = "exit") -> None:
+        """The match summary, once: on the server saying the game is over, or when this process exits."""
+        if self._finished or self.memory.step == 0:
+            return
+        self._finished = True  # the runner's own end-of-game hook never reaches this process
+        try:
             m = self.memory
             trace.write("final", step=m.step, projection=m.projection(), dealt=round(m.dealt), taken=round(m.taken),
                         kills=m.team_kills, deaths=m.team_deaths, calibration=round(m.calibration, 3),
                         radius=round(m.R), fights=[f.as_json(m.step) for f in m.fights],
-                        fallbacks=self.fallbacks, general_calls=self.general.version)
+                        fallbacks=self.fallbacks, general_calls=self.general.version, why=why,
+                        jev=m.jev_record(), calibration_by_place={k: len(v) for k, v in m._calib_by.items()})
+        except Exception:  # noqa: BLE001 - bookkeeping must never matter
+            pass
 
     # -- observing -----------------------------------------------------------------------
 
@@ -232,7 +242,7 @@ class HokAgent:
                     if m in entry["macros"]:
                         self.memory.observe_reach(distance(entry["macros"][m]), m)
             events = self.memory.update(team_view(state))
-            self._readings, self._ahead = {}, {}
+            self._readings, self._ahead, self._defend = {}, {}, {}
             for seat in seats:
                 r = self.judge.read(seat)
                 if r is not None:
@@ -243,11 +253,18 @@ class HokAgent:
             fight = self.memory.open_fight
             if fight is not None and fight.predicted is None:
                 fight.predicted = self.judge.expected_ratio(list(self._readings.values()))
+            advice = self.tactician.current()
+            if fight is not None and fight.jev_p is None and advice is not None and advice.win_fight is not None:
+                fight.jev_p = advice.win_fight  # scored against the real exchange when the fight ends
+            self.tactician.maybe_update(
+                self.memory, self._readings, standing_orders(state), self.general.current()
+            )
             self.general.maybe_update(
                 self.memory,
                 events,
                 [r.as_json() for r in (*self._readings.values(), *self._ahead.values())],
                 seats,
+                extra={"tactician": (self.tactician.current().as_json() if self.tactician.current() else None)},
             )
             for ev in events:
                 trace.write("event", step=step, event=ev)
@@ -269,22 +286,50 @@ class HokAgent:
             reading = self._readings.get(seat)
             stance = plan.stance(seat)
             source = "model"
+            hold = False
             if stance == "auto":
                 if reading is None:
                     raise LookupError("no reading for this hero")
-                if plan.posture == "defend" and reading.visible_enemies == 0:
-                    stance = "retreat"
-                else:
-                    stance = "engage" if self.judge.engage(reading, plan.risk) else "retreat"
-                    if stance == "retreat" and not self.judge.can_escape(reading):
-                        stance, source = "engage", "model/cornered"  # cannot outrun them: fight, don't flee
+                stance = "engage" if self.judge.engage(reading, plan.risk) else "retreat"
+                if stance == "retreat" and not self.judge.can_escape(reading):
+                    stance, source = "engage", "model/cornered"  # cannot outrun them: fight, don't flee
+                if stance == "engage":
+                    # Jev may make a hero more careful (never less): a confident answer, fresh, from the plan's trust
+                    caution = self.tactician.caution(seat, plan.jev_trust)
+                    if caution == "retreat" and self.judge.can_escape(reading):
+                        stance, source = "retreat", "jev"
+                    elif caution == "hold":
+                        hold, source = True, "jev"
+            if stance == "retreat" and reading is not None and reading.in_reach == 0 and plan.stance(seat) == "auto":
+                # Nobody is on this hero: "retreat" would only be a trip home to heal. Go only if healing beats
+                # staying: a round trip of 2 x flee_s misses that share of the time between fights, so a hero
+                # with more hp than 1 - trip/interval is worth more at the tower than on the road.
+                trip = 2.0 * reading.flee_s
+                if reading.hp_share >= 1.0 - trip / max(self.memory.fight_interval(), 1e-6):
+                    stance, hold, source = "engage", True, source + "/stay"
             if stance == "retreat" and "macro_retreat" in macros:
-                return "macro_retreat", "model"
+                return "macro_retreat", source
             want = engage_macro(macros, self.memory.R)
             if want == "macro_advance" and plan.stance(seat) == "auto":
+                # One of our structures is being hit: that is a fight to answer, whatever the posture. Go if the
+                # force there (with the structure on our side) is one this hero's side can beat, else hold.
+                siege = self.memory.defend_point()
+                if siege is not None:
+                    at = self.judge.read_toward(seat, siege, "defend")
+                    if at is not None:
+                        self._defend[seat] = at
+                        if self.judge.engage(at, plan.risk):
+                            return "macro_advance", "model/defend"
+                        return HOLD, "model/defend"
+                # Nothing in reach: this hero is about to walk into something. "defend" never walks in; "pressure"
+                # always does; otherwise it goes only if the force expected where it is going is one it can beat.
                 ahead = self._ahead.get(seat)
-                if ahead is not None and not self.judge.engage(ahead, plan.risk):
-                    return HOLD, "model"  # walking in alone or into more than we can take: wait
+                if (
+                    hold
+                    or plan.posture == "defend"
+                    or (plan.posture != "pressure" and ahead is not None and not self.judge.engage(ahead, plan.risk))
+                ):
+                    return HOLD, source
             if want is not None:
                 return want, source
         except Exception as exc:  # noqa: BLE001
@@ -292,6 +337,26 @@ class HokAgent:
         want = floor_macro(seat_summary(state, seat), macros)
         self._note_fallback("floor", "model could not decide", seat, want)
         return want, "floor"
+
+    def _hold_macro(self, seat: int, macros: dict[str, str], standing: dict[int, str]) -> str | None:
+        """Hold position without a wait command: keep the hero within a second's walk of our front tower by
+        stepping back when it is past the point and forward when it is short of it. ``None`` means it is
+        inside the band and already heading the right way, so leave its order alone."""
+        m = self.memory
+        me = m.ours.get(seat)
+        lane, rally = m.lane(), m.front_tower()
+        here, there = m.progress(pos(me) if me else None), m.progress(rally)
+        if lane is None or here is None or there is None:
+            return None
+        band = m.speed * HOLD_BAND_S / max(1.0, dist(*lane))
+        if here > there + band and "macro_retreat" in macros:
+            return "macro_retreat"
+        if here < there - band and "macro_advance" in macros:
+            return "macro_advance"
+        if standing.get(seat) in ("macro_advance", "macro_retreat"):
+            return None
+        want = "macro_advance" if here < there else "macro_retreat"
+        return want if want in macros else None
 
     def _note_fallback(
         self, kind: str, why: str, seat: int | None = None, chose: str | None = None
@@ -396,4 +461,4 @@ def create_agent():
     model = GeneralModel.from_gemini(GeminiClient.from_env()) if on else None
     if on and model is None:
         print("[hok] HOK_LLM=1 but no GEMINI_API_KEY: playing without the General", file=sys.stderr, flush=True)
-    return HokAgent(model)
+    return HokAgent(model, JevClient.from_env(flag="HOK_JEV"))
