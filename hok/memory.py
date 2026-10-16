@@ -36,6 +36,10 @@ MAX_FIGHTS = 40
 MAX_EVENTS = 40
 MAX_PLANS = 12
 SNAPSHOT_EVERY_S = 20.0
+TEMPO_NOW_S = 30.0  # measurement window: structure damage per second "lately"
+TEMPO_BURST_S = 20.0  # measurement window: the fastest siege each side has shown this match
+SIEGE_PRIOR_HP_S = 200.0  # prior: fastest 20 s siege in recorded matches (88694: 200, 76599: 290 hp/s); a faster one
+#                           seen in this match replaces it. Both teams have the same macros, so it applies to either.
 
 
 def power(hp: float | None, level: float | None) -> float:
@@ -142,6 +146,8 @@ class MatchMemory:
         self._reach_by: dict[str, deque[float]] = {}
         self.seconds_left: float | None = None
         self.max_steps: float | None = None
+        # every structure hp loss: (step, ours, hp lost, no living enemy hero in sight within reach of it)
+        self._struct_log: deque[tuple[int, bool, float, bool]] = deque(maxlen=4000)
 
     # -- update ------------------------------------------------------------------------
 
@@ -204,7 +210,8 @@ class MatchMemory:
                 float(e.get("max_hp") or hp or 1), lvl, step,
                 revive=float(e.get("revive_time") or 0),
             )
-        new += self._structures(view.get("structures") or [])
+        alive_seen = [pos(e) for e in visible_now if (e.get("hp") or 0) > 0 and pos(e)]
+        new += self._structures(view.get("structures") or [], alive_seen)
         self.ours = ours
         self._prev_ours = {s: dict(h) for s, h in ours.items()}
         new += self._fight(step, ours, view.get("enemies") or {}, our_lost, their_lost, kills, deaths)
@@ -212,7 +219,8 @@ class MatchMemory:
             self.events.append((step, ev))
         return new
 
-    def _structures(self, structures: list[dict[str, Any]]) -> list[str]:
+    def _structures(self, structures: list[dict[str, Any]],
+                    alive_seen: list[tuple[float, float]] | None = None) -> list[str]:
         new: list[str] = []
         xs, zs = [], []
         for s in structures:
@@ -224,6 +232,9 @@ class MatchMemory:
             if prev is not None and hp < prev["hp"]:
                 lost = prev["hp"] - hp
                 prev["hit_step"] = self.step
+                here = (float(s.get("x") or 0), float(s.get("z") or 0))
+                unseen = not any(dist(here, e) <= self.R for e in (alive_seen or []))
+                self._struct_log.append((self.step, s.get("camp") == self.camp, lost, unseen))
                 if s.get("camp") == self.camp:
                     self.taken += lost
                     new.append(f"our_structure_hit:{s.get('type')}")
@@ -485,6 +496,65 @@ class MatchMemory:
         lo, hi = CALIBRATION_BOUNDS
         return min(hi, max(lo, math.exp(total / n)))
 
+    def _rate(self, ours: bool, since: int, until: int | None = None) -> float:
+        lost = sum(l for st, o, l, _ in self._struct_log if o == ours and since < st <= (until or self.step))
+        span = ((until or self.step) - since) * STEP_S
+        return lost / span if span > 0 else 0.0
+
+    def _burst(self, ours: bool) -> float:
+        """The fastest structure damage one side has done this match, hp per second over a TEMPO_BURST_S window."""
+        w = round(TEMPO_BURST_S / STEP_S)
+        hits = [(st, l) for st, o, l, _ in self._struct_log if o == ours]
+        best, j, run = 0.0, 0, 0.0
+        for st, l in hits:  # sliding window over the hit times
+            run += l
+            while hits[j][0] <= st - w:
+                run -= hits[j][1]
+                j += 1
+            best = max(best, run)
+        return best / TEMPO_BURST_S
+
+    def tempo(self) -> dict[str, Any]:
+        """How fast each side turns time into tie-break score, measured: the rate lately, the fastest siege seen,
+        how many seconds of the enemy's fastest siege our structure lead (or deficit) is worth, and how much of
+        what our structures lost came with no enemy hero in sight near them (attackers the server does not list).
+        Also the punish window right now: dead enemies' return times against our walk to their front tower and
+        how long that tower lasts at our fastest siege (or theirs, as the reference, if we have none yet)."""
+        now_from = max(0, self.step - round(TEMPO_NOW_S / STEP_S))
+        their_burst, our_burst = self._burst(True), self._burst(False)
+        siege = max(our_burst, their_burst, SIEGE_PRIOR_HP_S)  # how fast a structure can fall, as far as we know
+        margin = self.dealt - self.taken
+        taken_unseen = sum(l for _, o, l, u in self._struct_log if o and u)
+        left = None if not isinstance(self.max_steps, (int, float)) else max(0.0, (self.max_steps - self.step) * STEP_S)
+        out: dict[str, Any] = {
+            "our_structure_hp_per_s_lately": round(self._rate(False, now_from), 1),
+            "their_structure_hp_per_s_lately": round(self._rate(True, now_from), 1),
+            "our_fastest_siege_hp_per_s": round(our_burst, 1),
+            "their_fastest_siege_hp_per_s": round(their_burst, 1),
+            "fastest_siege_known_hp_per_s": round(siege, 1),
+            "structure_margin_in_s_of_fastest_siege": round(margin / siege, 1),
+            "game_seconds_left": None if left is None else round(left),
+            "our_structure_hp_lost_with_no_enemy_hero_in_sight": round(taken_unseen),
+            "our_structure_hp_lost_total": round(self.taken),
+        }
+        dead = [(e, self.enemy_back_in(e)) for e in self.enemies.values() if self.enemy_back_in(e)]
+        target = None
+        for s in self.structs.values():
+            if s["camp"] != self.camp and s["type"] in ("ACTOR_TOWER", "ACTOR_CRYSTAL") and s["hp"] > 0 and pos(s):
+                if target is None or (self.progress(pos(s)) or 0) < (self.progress(pos(target)) or 0):
+                    target = s
+        alive = [pos(h) for h in self.ours.values() if (h.get("hp") or 0) > 0 and pos(h)]
+        if target is not None and alive and self.speed > 0:
+            walks = sorted(dist(p, pos(target)) / self.speed for p in alive)
+            out["punish_window"] = {
+                "enemies_dead": len(dead), "enemies_alive_or_unknown": 5 - len(dead),
+                "dead_back_in_s": sorted(round(b) for _, b in dead),
+                "target": str(target["type"]).replace("ACTOR_", "").lower(), "target_hp": round(target["hp"]),
+                "our_living_heroes_walk_s": [round(w) for w in walks],
+                "target_falls_in_s_at_fastest_siege": round(target["hp"] / siege),
+            }
+        return out
+
     # -- the General's view ---------------------------------------------------------------
 
     def note_plan(self, version: int, assessment: str, posture: str, risk: float) -> None:
@@ -542,6 +612,7 @@ class MatchMemory:
             "clock_s": round(now * STEP_S),
             "seconds_left": self.seconds_left,
             "projection": self.projection(),
+            "tempo": self.tempo(),
             "lane": self._lane_json(),
             "measured": {"hp_lost_per_second_per_enemy_in_reach": round(self.incoming),
                          "hero_speed_units_per_s": round(self.speed), "engagement_radius": round(self.R),

@@ -52,12 +52,19 @@ base, 1 is theirs. Standing towers shoot enemy heroes, so a fight beside our own
 theirs favours them.
 - Win by destroying the enemy crystal. A match is 3000 steps (10 minutes). If no crystal falls, the team with more damage to \
 enemy towers and crystal wins, then the team with more hero kills, else a draw. memory.projection says who wins now. \
-Towers are worth 4000 and 6000 hp each, so one tower is most of what a 10-minute game decides.
-- Heroes walk about 3,600 units per second. A hero that dies is out for revive_s seconds (11 at level 2 up to about 35 \
+Towers are worth 4000 and 6000 hp each, so one tower is most of what a 10-minute game decides. \
+Kills only matter when structure damage is exactly equal, which almost never happens: THE GOAL IS STRUCTURE DAMAGE \
+dealt minus taken. A kill is useful only as the time it buys to hit a structure, or to stop one of ours being hit.
+- Hero speed is measured (memory.measured.hero_speed_units_per_s; a hero crosses the whole lane in roughly 25 s). A hero that dies is out for revive_s seconds (11 at level 2 up to about 35 \
 at level 10); in that time the other side can take a tower freely: five heroes destroyed a 4000-hp tower in about 6 \
 seconds. A wipe or a lopsided fight is therefore worth a tower; a lost fight is worth the same to them.
 - Each enemy hero in reach costs about hp_lost_per_second_per_enemy_in_reach hp per second (measured). Retreat walks all \
 the way to base, so a hero in contact cannot get away unless it outlasts the walk (survive_s vs flee_s in its reading).
+- Structures are also hit by attackers the server does NOT list (no enemy hero in sight near the structure, sometimes \
+with all five enemy heroes dead). They are killable: in one match the damage stopped the moment our heroes reached the \
+crystal. In another, our 4000-hp front tower fell in 19 seconds at a steady ~225 hp/s while every enemy hero we could see \
+was dead, because our heroes had walked away from it. memory.tempo.our_structure_hp_lost_with_no_enemy_hero_in_sight \
+measures this in the current match. A structure being hit with no enemy visible is NOT safe: someone has to stand on it.
 - Past matches: against a real opponent our team reached the centre spread out, retreated at the first bad number, and \
 died while fleeing having dealt almost no damage; the enemy was at the centre by 18 seconds. Fighting at our own tower, \
 together, is the plan we are trying instead of meeting them in the open.
@@ -88,13 +95,21 @@ tower damage, and every structure hit on us must be answered.
 - 1. DEFEND what is being hit. memory.our_structures_under_attack lists it. The executor sends heroes to a structure \
 under attack when the fight there is winnable (the structure counts on our side); keep `risk` low enough that it does.
 - 2. FIGHT AT OUR FRONT TOWER. That is where the tower fights for us and where we can punish from.
-- 3. PUNISH. enemy_heroes_known shows dead_back_in_s for dead enemies. From our front tower the enemy front tower is about \
-9 seconds away; from our base about 22. When three or more enemies are dead and will not be back before we get there, \
-switch to `pressure`: five heroes take a 4000-hp tower in about 6 seconds. Return to `balanced` once they are back. A \
-push that starts from our base is usually too late.
+- 3. PUNISH. memory.tempo.punish_window puts the numbers side by side: how many enemies are dead and when each is back \
+(dead_back_in_s), how long each of our living heroes needs to walk to their nearest structure (our_living_heroes_walk_s), \
+and how long that structure lasts at the fastest siege seen this match (target_falls_in_s_at_fastest_siege). A push is \
+worth it when enough of our heroes arrive, and the structure falls (or loses a large share), before enough of theirs are \
+back to make the fight there one we lose. Kills that are never followed by a push are worth almost nothing on the \
+tie-break. Your plan reaches the heroes 10-25 s late: judge the window as it will be then. Return to `balanced` once \
+they are back.
 - 4. NEVER LEAVE OUR CRYSTAL OR A TOWER EXPOSED to go somewhere else. Read `side` on every structure: OURS or THEIRS. \
 Do not confuse them.
-- 5. Late in the game, protect a lead on structure damage; if behind, the punish window is the only good chance.
+- 5. A LEAD IS MEASURED IN SECONDS, NOT HP. memory.tempo.structure_margin_in_s_of_fastest_siege says how many \
+seconds of the fastest siege known (fastest_siege_known_hp_per_s) our structure lead absorbs; compare it with game_seconds_left. In our last match \
+we held a 151-hp lead with 12 more kills, called the game "secured" for ten plans while defending and dealing nothing, \
+and lost: 151 hp was under one second of their siege, and they took 4000 hp in the last minute. A lead smaller than \
+what they can deal in the time left is not a lead. Protect a real lead by standing on whatever of ours is being hit; \
+grow a thin one with the punish window; if behind, structure damage is the only thing that counts and kills do not.
 
 HOW TO REASON
 - Read recent_fights: expected_ratio against realised_ratio says whether the fight model is optimistic. \
@@ -109,7 +124,8 @@ about to arrive, the chance we win the engagement). Treat it as a second opinion
 - Enemy heroes out of sight are not gone: last_seen_s_ago says how old a sighting is. Heroes never seen are expected \
 to mirror our own advance.
 
-What you do not know: hero kits, skill ranges and cooldowns, minions, and the opponent's style beyond what the memory \
+What you do not know: hero kits, skill ranges and cooldowns, what exactly the unlisted attackers are (how many, where \
+they walk), and the opponent's style beyond what the memory \
 shows. Do not invent them.
 
 Answer with one JSON object only:
