@@ -23,6 +23,7 @@ regardless of what OS this ever runs on — Windows has no ``fork`` at all.
 from __future__ import annotations
 
 import multiprocessing
+import os
 import time
 from collections.abc import Callable, Collection
 from datetime import UTC, datetime
@@ -524,6 +525,29 @@ def _note_other_kind(
         log(TEST_MATCH_WAITING_NOTE)
 
 
+ONLY_GAMES_ENV = "ALTRUAGENT_ONLY_GAMES"
+
+
+def _only_games() -> frozenset[str]:
+    """Game types this runtime may play (``ALTRUAGENT_ONLY_GAMES=a,b``); empty means every game."""
+    raw = os.environ.get(ONLY_GAMES_ENV, "")
+    return frozenset(g.strip().lower() for g in raw.split(",") if g.strip())
+
+
+def _note_other_game(
+    assignment: OfficialAssignment, state: TournamentState, log: Callable[[str], None]
+) -> None:
+    """Say once per game that a game this runtime was told not to play is waiting."""
+    game = assignment.match_id or assignment.seat_id
+    if game in state.noted_games:
+        return
+    state.noted_games.add(game)
+    log(
+        f"Skipping a {_clean(assignment.game_type) or 'game'}{_kind_label(assignment)}: this runtime "
+        f"only plays {', '.join(sorted(_only_games()))} ({ONLY_GAMES_ENV})."
+    )
+
+
 def run_tournament_once(
     official: OfficialAgentClient,
     state: TournamentState,
@@ -770,6 +794,10 @@ def run_tournament_once(
     for assignment in [] if state.key_refused else assignments:
         seat_id = assignment.seat_id
         if not seat_id or state.registry.is_active(seat_id):
+            continue
+        only = _only_games()
+        if only and (assignment.game_type or "").strip().lower() not in only:
+            _note_other_game(assignment, state, log)
             continue
         if assignment_kind(assignment) not in kinds:
             _note_other_kind(assignment, state, log)

@@ -31,6 +31,7 @@ from common import trace
 _FACTORY_MODULES = {
     "pokemon_vgc_doubles_draft": "pokemon.agent",
     "werewolf": "werewolf.agent",
+    "honor_of_kings_5v5": "hok.agent",
 }
 _FALLBACK_MODULE = "common.fallback"
 
@@ -69,6 +70,16 @@ def _trace_game_end(final_state: Any, context: DecisionContext) -> None:
             score=_score(final_state, agent_id),
             termination_reason=getattr(final_state, "termination_reason", None),
         )
+        if getattr(context, "game_type", None) == "honor_of_kings_5v5":
+            from hok import trace as hok_trace
+
+            hok_trace.write(
+                "final",
+                outcome=outcome,
+                score=_score(final_state, agent_id),
+                termination_reason=getattr(final_state, "termination_reason", None),
+                raw=getattr(final_state, "final_result", None),
+            )
     except Exception:  # noqa: BLE001 - bookkeeping must never cost a match
         pass
 
@@ -120,8 +131,8 @@ class QuicksilverAgent:
         return self._delegate
 
     def _traced(self) -> bool:
-        # Red Alert writes its own, richer trace.
-        return self.game_type != "red_alert"
+        # Red Alert and Honor of Kings write their own, richer traces.
+        return self.game_type not in ("red_alert", "honor_of_kings_5v5")
 
     def choose_action(self, state: GameState, context: DecisionContext):
         delegate = self._delegate_for(context)
